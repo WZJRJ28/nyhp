@@ -52,13 +52,17 @@ func TestEsignCompletion_Integration(t *testing.T) {
 		t.Fatalf("seed user: %v", err)
 	}
 
+	makeFein := func(prefix string) string {
+		return fmt.Sprintf("%s-%07d", prefix, time.Now().UnixNano()%10000000)
+	}
+
 	// brokers
-	if err := mustQueryRow(`INSERT INTO brokers (name) VALUES ($1) RETURNING id`,
-		fmt.Sprintf("Manhattan Realty %d", time.Now().UnixNano())).Scan(&fromBroker); err != nil {
+	if err := mustQueryRow(`INSERT INTO brokers (name, fein, verified) VALUES ($1, $2, $3) RETURNING id`,
+		fmt.Sprintf("Manhattan Realty %d", time.Now().UnixNano()), makeFein("11"), true).Scan(&fromBroker); err != nil {
 		t.Fatalf("seed from broker: %v", err)
 	}
-	if err := mustQueryRow(`INSERT INTO brokers (name) VALUES ($1) RETURNING id`,
-		fmt.Sprintf("Brooklyn Realty %d", time.Now().UnixNano())).Scan(&toBroker); err != nil {
+	if err := mustQueryRow(`INSERT INTO brokers (name, fein, verified) VALUES ($1, $2, $3) RETURNING id`,
+		fmt.Sprintf("Brooklyn Realty %d", time.Now().UnixNano()), makeFein("22"), false).Scan(&toBroker); err != nil {
 		t.Fatalf("seed to broker: %v", err)
 	}
 
@@ -107,17 +111,17 @@ func TestEsignCompletion_Integration(t *testing.T) {
 		t.Fatalf("handle webhook (first): %v", err)
 	}
 
-	// Verify agreement is effective and eff_time set
+	// Verify agreement is effective and effective_at set
 	var status string
 	var effTime *time.Time
-	if err := mustQueryRow(`SELECT status, eff_time FROM agreements WHERE id = $1`, agreementID).Scan(&status, &effTime); err != nil {
+	if err := mustQueryRow(`SELECT status, effective_at FROM agreements WHERE id = $1`, agreementID).Scan(&status, &effTime); err != nil {
 		t.Fatalf("verify agreement: %v", err)
 	}
 	if status != "effective" {
 		t.Fatalf("expected agreement status 'effective', got %q", status)
 	}
 	if effTime == nil || effTime.IsZero() {
-		t.Fatalf("expected eff_time to be set")
+		t.Fatalf("expected effective_at to be set")
 	}
 
 	// Verify one timeline event ESIGN_COMPLETED with seq=1

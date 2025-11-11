@@ -62,7 +62,7 @@ func TestACNConcurrency(t *testing.T) {
 		} else {
 			dsn, err = infra.InitLocalDatabase(ctx)
 			if err != nil {
-				t.Fatalf("init local database: %v", err)
+				t.Skipf("skipping stress run: %v (set -dsn or STRESS_TEST_PG_DSN to force execution)", err)
 			}
 			pgC = &infra.PGContainer{}
 		}
@@ -91,9 +91,9 @@ func TestACNConcurrency(t *testing.T) {
 	// creators and signers battling over same referral
 	for i := 0; i < *flConcurrency; i++ {
 		g.Go(func() error {
-			return actors.Creator(ctx2, pool, seedData.referralID, seedData.fromBroker, seedData.toBroker, stop)
+			return actors.Creator(ctx2, pool, seedData.referralRequest, seedData.fromBroker, seedData.toBroker, stop)
 		})
-		g.Go(func() error { return actors.Signer(ctx2, pool, seedData.referralID, stop) })
+		g.Go(func() error { return actors.Signer(ctx2, pool, seedData.referralRequest, stop) })
 	}
 
 	// pii reader
@@ -157,11 +157,12 @@ func dockerAvailable(ctx context.Context) bool {
 }
 
 type seedIDs struct {
-	userID      string
-	fromBroker  string
-	toBroker    string
-	referralID  string
-	agreementID string
+	userID          string
+	fromBroker      string
+	toBroker        string
+	referralID      string
+	referralRequest string
+	agreementID     string
 }
 
 func mustSeed(t *testing.T, ctx context.Context, pool *pgxpool.Pool) seedIDs {
@@ -171,19 +172,33 @@ func mustSeed(t *testing.T, ctx context.Context, pool *pgxpool.Pool) seedIDs {
 	if err := pool.QueryRow(ctx, `INSERT INTO users (email, full_name) VALUES ($1,$2) RETURNING id`, fmt.Sprintf("u%d@example.com", rand.Int63()), "Stress User").Scan(&s.userID); err != nil {
 		t.Fatalf("seed user: %v", err)
 	}
+	makeFein := func() string {
+		return fmt.Sprintf("%02d-%07d", rand.Intn(90)+10, rand.Intn(1_000_0000))
+	}
+
 	// brokers
-	if err := pool.QueryRow(ctx, `INSERT INTO brokers (name) VALUES ($1) RETURNING id`, fmt.Sprintf("From %d", rand.Int63())).Scan(&s.fromBroker); err != nil {
+	if err := pool.QueryRow(ctx, `INSERT INTO brokers (name, fein, verified) VALUES ($1, $2, $3) RETURNING id`, fmt.Sprintf("From %d", rand.Int63()), makeFein(), true).Scan(&s.fromBroker); err != nil {
 		t.Fatalf("seed broker from: %v", err)
 	}
-	if err := pool.QueryRow(ctx, `INSERT INTO brokers (name) VALUES ($1) RETURNING id`, fmt.Sprintf("To %d", rand.Int63())).Scan(&s.toBroker); err != nil {
+	if err := pool.QueryRow(ctx, `INSERT INTO brokers (name, fein, verified) VALUES ($1, $2, $3) RETURNING id`, fmt.Sprintf("To %d", rand.Int63()), makeFein(), false).Scan(&s.toBroker); err != nil {
 		t.Fatalf("seed broker to: %v", err)
 	}
-	// referral
+	// referral + referral_request
 	if err := pool.QueryRow(ctx, `INSERT INTO referrals (created_by_user_id, status) VALUES ($1,'open') RETURNING id`, s.userID).Scan(&s.referralID); err != nil {
-		t.Fatalf("seed referral: %v", err)
+		t.Fatalf("seed referrals legacy: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+        INSERT INTO referral_requests (created_by_user_id, region, price_min, price_max, property_type, deal_type, languages, sla_hours, status)
+        VALUES ($1, ARRAY['us-ea'], 100000, 200000, 'condo', 'buy', ARRAY['English'], 48, 'open')
+        RETURNING id
+    `, s.userID).Scan(&s.referralRequest); err != nil {
+		t.Fatalf("seed referral_request: %v", err)
 	}
 	// initial pending_signature agreement
-	if err := pool.QueryRow(ctx, `INSERT INTO agreements (referral_id, from_broker_id, to_broker_id, status) VALUES ($1,$2,$3,'pending_signature') RETURNING id`, s.referralID, s.fromBroker, s.toBroker).Scan(&s.agreementID); err != nil {
+	if err := pool.QueryRow(ctx, `
+        INSERT INTO agreements (referral_id, from_broker_id, to_broker_id, fee_rate, protect_days, status)
+        VALUES ($1,$2,$3,30,90,'pending_signature') RETURNING id
+    `, s.referralRequest, s.fromBroker, s.toBroker).Scan(&s.agreementID); err != nil {
 		t.Fatalf("seed agreement: %v", err)
 	}
 	// attach a pii contact row to exercise gate after effective

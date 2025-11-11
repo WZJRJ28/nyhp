@@ -2,6 +2,7 @@ package actors
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -25,8 +26,19 @@ func Creator(ctx context.Context, pool *pgxpool.Pool, referralID, fromBroker, to
                                    VALUES ($1,$2,$3,'pending_signature')`, referralID, fromBroker, toBroker)
 		if err != nil {
 			var pgErr *pgconn.PgError
-			if errors.As(err, &pgErr) && pgErr.Code == "23505" { // unique constraint
-				// expected under contention
+			if errors.As(err, &pgErr) {
+				switch pgErr.Code {
+				case "23505":
+					// unique constraint under contention, ignore
+				case "57P01", "57P02", "57P03":
+					// backend terminated by chaos; brief backoff and retry
+					time.Sleep(50 * time.Millisecond)
+					continue
+				default:
+					return fmt.Errorf("creator insert: %w", err)
+				}
+			} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
 			} else {
 				return fmt.Errorf("creator insert: %w", err)
 			}
@@ -49,15 +61,25 @@ func Signer(ctx context.Context, pool *pgxpool.Pool, referralID string, stop <-c
 		if err != nil {
 			return err
 		}
-		var agID string
-		err = tx.QueryRow(ctx, `SELECT id FROM agreements WHERE referral_id=$1 AND status='pending_signature' LIMIT 1 FOR UPDATE`, referralID).Scan(&agID)
+		var (
+			agID       string
+			fromBroker sql.NullString
+			toBroker   sql.NullString
+		)
+		err = tx.QueryRow(ctx, `SELECT id, from_broker_id::text, to_broker_id::text FROM agreements WHERE referral_id=$1 AND status='pending_signature' LIMIT 1 FOR UPDATE`, referralID).
+			Scan(&agID, &fromBroker, &toBroker)
 		if err == nil {
-			_, err = tx.Exec(ctx, `UPDATE agreements SET status='effective', eff_time = COALESCE(eff_time, NOW()) WHERE id=$1`, agID)
+			_, err = tx.Exec(ctx, `UPDATE agreements SET status='effective', effective_at = COALESCE(effective_at, get_tx_timestamp()) WHERE id=$1`, agID)
 			if err == nil {
+				brokerID := fromBroker.String
+				if brokerID == "" {
+					brokerID = toBroker.String
+				}
+				if brokerID != "" {
+					_, _ = tx.Exec(ctx, `SET LOCAL app.broker_id = $1`, brokerID)
+				}
 				// append an ESIGN_COMPLETED timeline event
-				var seq int
-				_ = tx.QueryRow(ctx, `SELECT COALESCE(MAX(seq),0)+1 FROM timeline_events WHERE agreement_id=$1`, agID).Scan(&seq)
-				_, _ = tx.Exec(ctx, `INSERT INTO timeline_events (agreement_id, seq, type, payload) VALUES ($1,$2,'ESIGN_COMPLETED','{}'::jsonb)`, agID, seq)
+				_, _ = tx.Exec(ctx, `INSERT INTO timeline_events (agreement_id, type, payload) VALUES ($1,'ESIGN_COMPLETED','{}'::jsonb)`, agID)
 				_, _ = tx.Exec(ctx, `INSERT INTO outbox (topic, payload) VALUES ('agreement.effective', jsonb_build_object('agreement_id',$1))`, agID)
 			}
 		}
@@ -86,6 +108,14 @@ func PIIReader(ctx context.Context, pool *pgxpool.Pool, agreementID, actorID str
 
 // EventWriter appends various events including correction payload checks.
 func EventWriter(ctx context.Context, pool *pgxpool.Pool, agreementID string, stop <-chan struct{}) error {
+	var (
+		fromBroker sql.NullString
+		toBroker   sql.NullString
+	)
+	if err := pool.QueryRow(ctx, `SELECT from_broker_id::text, to_broker_id::text FROM agreements WHERE id=$1`, agreementID).Scan(&fromBroker, &toBroker); err != nil {
+		return err
+	}
+
 	types := []string{"OFFER_MADE", "DEAL_CLOSED"}
 	for {
 		select {
@@ -100,12 +130,14 @@ func EventWriter(ctx context.Context, pool *pgxpool.Pool, agreementID string, st
 		if err != nil {
 			return err
 		}
-		var seq int
-		if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(seq),0)+1 FROM timeline_events WHERE agreement_id=$1`, agreementID).Scan(&seq); err != nil {
-			_ = tx.Rollback(ctx)
-			continue
+		brokerID := fromBroker.String
+		if brokerID == "" {
+			brokerID = toBroker.String
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO timeline_events (agreement_id, seq, type, payload) VALUES ($1,$2,$3,'{}'::jsonb)`, agreementID, seq, ty)
+		if brokerID != "" {
+			_, _ = tx.Exec(ctx, `SET LOCAL app.broker_id = $1`, brokerID)
+		}
+		_, err = tx.Exec(ctx, `INSERT INTO timeline_events (agreement_id, type, payload) VALUES ($1,$2,'{}'::jsonb)`, agreementID, ty)
 		if err != nil {
 			_ = tx.Rollback(ctx)
 			continue
@@ -145,10 +177,10 @@ func OutboxWorker(ctx context.Context, pool *pgxpool.Pool, stop <-chan struct{})
 		for _, id := range ids {
 			// simulate random failure
 			if rand.Intn(10) == 0 {
-				_, _ = tx.Exec(ctx, `UPDATE outbox SET attempts=attempts+1, last_attempt=NOW() WHERE id=$1`, id)
+				_, _ = tx.Exec(ctx, `UPDATE outbox SET attempts=attempts+1, last_attempt=get_tx_timestamp() WHERE id=$1`, id)
 				continue
 			}
-			_, _ = tx.Exec(ctx, `UPDATE outbox SET status='processed', last_attempt=NOW() WHERE id=$1`, id)
+			_, _ = tx.Exec(ctx, `UPDATE outbox SET status='processed', last_attempt=get_tx_timestamp() WHERE id=$1`, id)
 		}
 		_ = tx.Commit(ctx)
 		time.Sleep(100 * time.Millisecond)
@@ -168,7 +200,7 @@ func EdgeAdapter(ctx context.Context, pool *pgxpool.Pool, key, route string, sto
 		_, err := pool.Exec(ctx, `INSERT INTO edge_invocations(key, route, status) VALUES ($1,$2,'pending') ON CONFLICT DO NOTHING`, key, route)
 		if err == nil {
 			// first registrant completes
-			_, _ = pool.Exec(ctx, `UPDATE edge_invocations SET status='completed', last_attempt_at=NOW(), response_code=200 WHERE key=$1`, key)
+			_, _ = pool.Exec(ctx, `UPDATE edge_invocations SET status='completed', last_attempt_at=get_tx_timestamp(), response_code=200 WHERE key=$1 AND route=$2`, key, route)
 		}
 		time.Sleep(80 * time.Millisecond)
 	}

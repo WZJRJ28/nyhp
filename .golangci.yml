@@ -1,0 +1,47 @@
+run:
+  timeout: 5m
+  tests: true
+  issues-exit-code: 1
+  allow-parallel-runners: true
+  modules-download-mode: readonly
+  # Limit scope to backend directory
+  skip-dirs:
+    - node_modules
+    - test
+  skip-files:
+    - "^vendor/"
+
+linters:
+  enable:
+    - govet
+    - staticcheck
+    - errcheck
+    - gosimple
+    - ineffassign
+    - typecheck
+    - unused
+  disable:
+    - depguard
+
+linters-settings:
+  govet:
+    enable-all: true
+    disable:
+      - fieldalignment
+  errcheck:
+    exclude-functions:
+      - (*database/sql.Rows).Close
+      - (*database/sql.Tx).Rollback
+  staticcheck:
+    checks: ["all"]
+
+issues:
+  exclude-use-default: false
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - errcheck
+        - ineffassign
+    - path: backend/.*
+      text: "(G114:|SA1019:)"
+

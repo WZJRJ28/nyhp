@@ -1,0 +1,6 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "backend/.cache/tsconfig.app.tsbuildinfo"
+  }
+}

@@ -2,6 +2,7 @@ package agreement
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -48,17 +49,12 @@ func (r *Repository) ExecuteEsignCompletionTx(ctx context.Context, tx pgx.Tx, pa
 		return fmt.Errorf("agreement: missing agreement id")
 	}
 
-	effTime, err := r.markAgreementEffective(ctx, tx, params.AgreementID)
+	effTime, fromBrokerID, toBrokerID, err := r.markAgreementEffective(ctx, tx, params.AgreementID)
 	if err != nil {
 		return err
 	}
 
-	nextSeq, err := r.nextTimelineSequence(ctx, tx, params.AgreementID)
-	if err != nil {
-		return err
-	}
-
-	if err := r.appendTimelineEvent(ctx, tx, params, nextSeq, effTime); err != nil {
+	if err := r.appendTimelineEvent(ctx, tx, params, effTime, fromBrokerID, toBrokerID); err != nil {
 		return err
 	}
 
@@ -69,42 +65,39 @@ func (r *Repository) ExecuteEsignCompletionTx(ctx context.Context, tx pgx.Tx, pa
 	return nil
 }
 
-func (r *Repository) markAgreementEffective(ctx context.Context, tx pgx.Tx, agreementID string) (time.Time, error) {
+func (r *Repository) markAgreementEffective(ctx context.Context, tx pgx.Tx, agreementID string) (time.Time, string, string, error) {
 	const updateSQL = `
 UPDATE agreements
 SET status = 'effective',
-    eff_time = COALESCE(eff_time, get_tx_timestamp())
+    effective_at = COALESCE(effective_at, get_tx_timestamp())
 WHERE id = $1
-RETURNING eff_time;
+RETURNING effective_at, from_broker_id::text, to_broker_id::text;
 `
 
-	var effTime time.Time
-	if err := tx.QueryRow(ctx, updateSQL, agreementID).Scan(&effTime); err != nil {
+	var (
+		effTime      time.Time
+		fromBrokerID sql.NullString
+		toBrokerID   sql.NullString
+	)
+	if err := tx.QueryRow(ctx, updateSQL, agreementID).Scan(&effTime, &fromBrokerID, &toBrokerID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return time.Time{}, ErrAgreementNotFound
+			return time.Time{}, "", "", ErrAgreementNotFound
 		}
-		return time.Time{}, fmt.Errorf("agreement: update effective: %w", err)
+		return time.Time{}, "", "", fmt.Errorf("agreement: update effective: %w", err)
 	}
 
-	return effTime, nil
-}
-
-func (r *Repository) nextTimelineSequence(ctx context.Context, tx pgx.Tx, agreementID string) (int, error) {
-	const seqSQL = `
-SELECT COALESCE(MAX(seq), 0) + 1
-FROM timeline_events
-WHERE agreement_id = $1;
-`
-
-	var seq int
-	if err := tx.QueryRow(ctx, seqSQL, agreementID).Scan(&seq); err != nil {
-		return 0, fmt.Errorf("agreement: fetch next timeline seq: %w", err)
+	if !fromBrokerID.Valid || !toBrokerID.Valid {
+		return time.Time{}, "", "", fmt.Errorf("agreement: broker linkage missing")
 	}
 
-	return seq, nil
+	return effTime, fromBrokerID.String, toBrokerID.String, nil
 }
 
-func (r *Repository) appendTimelineEvent(ctx context.Context, tx pgx.Tx, params ExecuteEsignCompletionParams, seq int, effTime time.Time) error {
+func (r *Repository) appendTimelineEvent(ctx context.Context, tx pgx.Tx, params ExecuteEsignCompletionParams, effTime time.Time, fromBrokerID, toBrokerID string) error {
+	if err := setTimelineBroker(ctx, tx, fromBrokerID, toBrokerID, params.ActorID); err != nil {
+		return err
+	}
+
 	payload := params.TimelinePayload
 	if payload == nil {
 		payload = make(map[string]any, 3)
@@ -123,11 +116,11 @@ func (r *Repository) appendTimelineEvent(ctx context.Context, tx pgx.Tx, params 
 	}
 
 	const insertSQL = `
-INSERT INTO timeline_events (agreement_id, seq, type, payload, actor_id)
-VALUES ($1, $2, 'ESIGN_COMPLETED', $3, $4);
+INSERT INTO timeline_events (agreement_id, type, payload, actor_id)
+VALUES ($1, 'ESIGN_COMPLETED', $2, $3);
 `
 
-	if _, err := tx.Exec(ctx, insertSQL, params.AgreementID, seq, payloadBytes, actorID); err != nil {
+	if _, err := tx.Exec(ctx, insertSQL, params.AgreementID, payloadBytes, actorID); err != nil {
 		return fmt.Errorf("agreement: insert timeline event: %w", err)
 	}
 

@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: brokerflow_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd="pg_isready -U postgres" 
+          --health-interval=10s 
+          --health-timeout=5s 
+          --health-retries=5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go (from go.mod)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          check-latest: true
+      - name: Go env
+        run: |
+          go version
+          go env
+      - name: Install golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
+      - name: Lint (backend)
+        run: |
+          cd backend
+          golangci-lint run ./...
+      - name: Apply migrations (dry run DB)
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/brokerflow_test?sslmode=disable
+        run: |
+          cd backend
+          ./scripts/dev_migrate.sh
+      - name: Build backend
+        run: |
+          cd backend
+          go build ./...
+      - name: Test backend
+        run: |
+          cd backend
+          GOCACHE=$(pwd)/.gocache go test ./...
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'pnpm'
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: true
+      - name: Lint (web)
+        run: pnpm lint
+      - name: Typecheck (web)
+        run: pnpm typecheck
+

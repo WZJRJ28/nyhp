@@ -1,0 +1,22 @@
+node_modules
+.aider*
+playwright-report/
+test-results/
+.cache/
+.DS_Store
+.idea/
+.vscode/
+*.log
+*.out
+coverage/
+pnpm-lock.yaml
+
+# Env files (keep .env.example tracked)
+.env*
+!.env.example
+
+# Backend caches and local artifacts
+backend/.gocache/
+backend/.cache/
+backend/.claude/
+backend/prompt

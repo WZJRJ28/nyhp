@@ -7,7 +7,7 @@ type Agreement struct {
 	ID                 string
 	ReferralID         string
 	Status             string
-	EffTime            *time.Time
+	EffectiveAt        *time.Time
 	PiiFirstAccessTime *time.Time
 }
 
@@ -15,9 +15,10 @@ type Agreement struct {
 type TimelineEvent struct {
 	ID          int64
 	AgreementID string
-	Seq         int
+	Seq         int64
 	Type        string
 	ActorID     *string
+	ActorBroker *string
 	CreatedAt   time.Time
 	Payload     []byte
 }

@@ -25,7 +25,7 @@ func All() []Oracle {
 			SQL: `SELECT e.* FROM timeline_events e
                   JOIN agreements a ON a.id = e.agreement_id
                   WHERE e.type IN ('OFFER_MADE','ESIGN_COMPLETED','DEAL_CLOSED')
-                  AND (a.status NOT IN ('effective','success','disputed') OR e.ts < a.eff_time)`,
+                  AND (a.status NOT IN ('effective','success','disputed') OR e.ts < a.effective_at)`,
 		},
 		{
 			Name: "O3_worm_seq_monotonic",
@@ -39,7 +39,7 @@ func All() []Oracle {
 			Name: "O4_pii_gate_bypass",
 			SQL: `SELECT * FROM audit_logs
                   WHERE action = 'PII_READ'
-                    AND ts <= (SELECT eff_time FROM agreements WHERE id = audit_logs.agreement_id)`,
+                    AND ts <= (SELECT effective_at FROM agreements WHERE id = audit_logs.agreement_id)`,
 		},
 		{
 			Name: "O5_outbox_edge_idem",
@@ -64,6 +64,15 @@ func All() []Oracle {
 		{
 			Name: "O7_region_immutable",
 			SQL:  `SELECT * FROM agreements_region_audit`,
+		},
+		{
+			Name: "O8_timeline_actor_broker",
+			SQL:  `SELECT id FROM timeline_events WHERE actor_broker_id IS NULL`,
+		},
+		{
+			Name: "O9_agreement_delete_guard",
+			SQL: `SELECT 'missing_no_delete_trigger' AS detail
+                  WHERE NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='no_delete_agreements')`,
 		},
 	}
 }
